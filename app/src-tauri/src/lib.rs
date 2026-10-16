@@ -18,6 +18,7 @@ mod links;
 mod cloud;
 mod backport;
 mod debrid;
+mod magnet;
 mod package_details;
 mod static_catalog;
 mod discovery;
@@ -1421,6 +1422,15 @@ fn job_error_stage(error: &str) -> &'static str {
         "monitoring-ended"
     } else {
         "failed"
+    }
+}
+
+/// What identifies one download: its URL, plus the file name for a magnet, whose torrent can
+/// hold many packages.
+fn download_identity(package: &Package) -> String {
+    match package.archive_file_name.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) if magnet::is_magnet(&package.url) => format!("{}#{name}", package.url.trim()),
+        _ => package.url.trim().to_string(),
     }
 }
 
@@ -5463,17 +5473,18 @@ fn validate_download_range(existing: u64, content_range: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Unlocks hoster link `index` of `count` through the debrid service: its direct URL, name and size.
-async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, request: &DeliveryRequest, link: &str, index: usize, count: usize, cancel: &watch::Receiver<bool>) -> Result<(String, Option<String>, Option<u64>), String> {
+/// Unlocks hoster link (or magnet) `index` of `count` through the debrid service: its direct URL, name and size.
+async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, request: &DeliveryRequest, package: &Package, index: usize, count: usize, cancel: &watch::Receiver<bool>) -> Result<(String, Option<String>, Option<u64>), String> {
     if *cancel.borrow() { return Err("cancelled".into()); }
     let (title, icon) = (request.title_name.clone().unwrap_or_default(), request.icon.clone());
+    let what = if magnet::is_magnet(&package.url) { "Adding torrent" } else { "Unlocking hoster link" };
     emit(app, Progress {
         job_id: job.into(), stage: "unlocking".into(), progress: index as f64 / count.max(1) as f64,
-        message: format!("Unlocking hoster link {}/{}", index + 1, count), title: title.clone(), icon: icon.clone(), ..Default::default()
+        message: format!("{what} {}/{}", index + 1, count), title: title.clone(), icon: icon.clone(), ..Default::default()
     });
     let provider_progress = |preparation: Option<debrid::PreparationProgress>| {
         let message = preparation.as_ref().map(|p| format!("{} · file {}/{}", p.state, index + 1, count))
-            .unwrap_or_else(|| format!("Unlocking hoster link {}/{}", index + 1, count));
+            .unwrap_or_else(|| format!("{what} {}/{}", index + 1, count));
         emit(app, Progress {
             job_id: job.into(), stage: "unlocking".into(), message,
             provider_preparation: preparation,
@@ -5481,8 +5492,16 @@ async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, re
         });
     };
     let mut cancelled = cancel.clone();
+    let link = package.url.as_str();
+    let preferred = request.provider.as_deref();
     tokio::select! {
-        result = debrid::resolve(http, s, link, request.provider.as_deref(), &provider_progress) => result,
+        result = async {
+            if magnet::is_magnet(link) {
+                debrid::resolve_magnet(http, s, link, package.archive_file_name.as_deref(), package.expected_size, preferred, &provider_progress).await
+            } else {
+                debrid::resolve(http, s, link, preferred, &provider_progress).await
+            }
+        } => result,
         _ = cancelled.changed() => Err("cancelled".into()),
     }
 }
@@ -5536,23 +5555,24 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                 }
                 let access_type = package.access_type.to_ascii_lowercase();
                 let mut url = package.url.clone();
-                let needs_unlock = match access_type.as_str() {
+                // A magnet always goes through a provider, whatever access type its source gave it.
+                let needs_unlock = magnet::is_magnet(&url) || match access_type.as_str() {
                     "direct" => false,
                     "hosterlanding" | "hoster-landing" => true,
                     _ => !direct_package(&url),
                 };
                 if needs_unlock && debrid::enabled(s).is_empty() {
-                    return Err(
-                        "This source returned a hoster link. Enable and configure Real-Debrid, TorBox, or AllDebrid in Settings before installing."
-                            .into(),
-                    );
+                    let link = if magnet::is_magnet(&url) { "magnet" } else { "hoster" };
+                    return Err(format!(
+                        "This source returned a {link} link. Enable and configure Real-Debrid, TorBox, or AllDebrid in Settings before installing."
+                    ));
                 }
                 let (mut rd_name, mut rd_size) = (None, None);
                 if needs_unlock {
-                    (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?;
+                    (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, package, index, parts.len(), rx).await?;
                 }
                 let file_key = download_key(
-                    &package.url,
+                    &download_identity(package),
                     request.title_id.as_deref(),
                     &package.kind,
                 );
@@ -5588,7 +5608,7 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                     if !downloader::renew_link(renewals, before, kept) { break; }
                     if let Err(error) = &fetched { session_log::write("download", &format!("Part {} continues with a new attempt after: {error}", index + 1)); }
                     (renewals, before) = (renewals + 1, kept);
-                    if needs_unlock { (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?; }
+                    if needs_unlock { (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, package, index, parts.len(), rx).await?; }
                     fetched = downloader::fetch(&context, &url, &part_path, size_hint(rd_size)).await;
                 }
                 let (header, content_type, disposition) = fetched?;
@@ -5820,7 +5840,7 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 let final_path = dir.join(format!(
                     "download_{}.pkg",
                     download_key(
-                        &request.package.url,
+                        &download_identity(&request.package),
                         request.title_id.as_deref(),
                         &request.package.kind
                     )

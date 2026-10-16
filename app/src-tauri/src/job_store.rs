@@ -238,7 +238,7 @@ fn reusable_base(record: &Record) -> bool {
 }
 
 fn same_backport(a: &BackportInput, b: &BackportInput) -> bool {
-    a.package.url == b.package.url || (a.package.label.eq_ignore_ascii_case(&b.package.label)
+    super::download_identity(&a.package) == super::download_identity(&b.package) || (a.package.label.eq_ignore_ascii_case(&b.package.label)
         && a.package.version == b.package.version && a.package.firmware == b.package.firmware)
 }
 
@@ -774,8 +774,8 @@ pub(super) async fn remove_job(app: AppHandle, job_id: String, delete_files: boo
 }
 
 pub(super) fn overlapping_delivery(a: &DeliveryRequest, b: &DeliveryRequest) -> bool {
-    let a_urls = std::iter::once(&a.package).chain(a.archive_parts.iter()).map(|part| part.url.trim()).filter(|url| !url.is_empty());
-    if a_urls.into_iter().any(|url| std::iter::once(&b.package).chain(b.archive_parts.iter()).any(|part| part.url.trim() == url)) {
+    let a_urls = std::iter::once(&a.package).chain(a.archive_parts.iter()).map(super::download_identity).filter(|url| !url.is_empty());
+    if a_urls.into_iter().any(|url| std::iter::once(&b.package).chain(b.archive_parts.iter()).any(|part| super::download_identity(part) == url)) {
         return true;
     }
     a.package.kind == "base" && b.package.kind == "base"
