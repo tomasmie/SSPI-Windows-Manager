@@ -1753,6 +1753,22 @@ enum ArtifactKind {
     Unknown,
 }
 
+/// The console file name for a downloaded exFAT image (boot sector OEM name "EXFAT"), in the
+/// `PPSA12345-v01.000.exfat` form SSPI uses for images it builds.
+fn prebuilt_image_name(header: &[u8], request: &DeliveryRequest) -> Option<String> {
+    if header.get(3..8) != Some(b"EXFAT".as_slice()) { return None; }
+    let wanted = request.package.archive_file_name.as_deref().unwrap_or_default();
+    let title = request.title_id.clone().filter(|id| title_id(id))
+        .or_else(|| wanted.split(|c: char| !c.is_ascii_alphanumeric()).find(|part| title_id(part)).map(str::to_string));
+    let version = request.package.version.trim();
+    let version = (!version.is_empty() && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')).then_some(version);
+    Some(match (title, version) {
+        (Some(title), Some(version)) => format!("{title}-v{version}.exfat"),
+        (Some(title), None) => format!("{title}.exfat"),
+        (None, _) => format!("image-{}.exfat", download_key(&download_identity(&request.package), None, &request.package.kind)),
+    })
+}
+
 fn artifact_kind(header: &[u8], name: &str, content_type: &str) -> ArtifactKind {
     if fpkg::package_magic(header) {
         return ArtifactKind::Pkg;
@@ -5872,6 +5888,22 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 let checkpoint = job_store::Checkpoint::Archive { primary, inputs: consumed_inputs, password: request.package.archive_password.clone() };
                 job_store::checkpoint(&app2, &job2, checkpoint.clone())?;
                 return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
+            }
+            let header = read_magic_sync(&primary).unwrap_or_default();
+            if let Some(name) = prebuilt_image_name(&header, &request) {
+                // A prebuilt ShadowMount image goes to the console as is, like one SSPI built.
+                let key = download_key(&download_identity(&request.package), request.title_id.as_deref(), &request.package.kind);
+                let image_dir = dir.join(format!("image_{key}"));
+                fs::create_dir_all(&image_dir).await.map_err(redact)?;
+                let final_path = image_dir.join(name);
+                fs::rename(&primary, &final_path).await.map_err(redact)?;
+                let checkpoint = job_store::Checkpoint::Package { path: final_path, dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] };
+                job_store::checkpoint(&app2, &job2, checkpoint.clone())?;
+                return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
+            }
+            let wanted = request.package.archive_file_name.as_deref().unwrap_or_default();
+            if let Some(ext) = Path::new(wanted).extension().and_then(|x| x.to_str()).filter(|x| ["ffpfsc", "ffpkg"].iter().any(|k| x.eq_ignore_ascii_case(k))) {
+                return Err(format!("{wanted} is a .{ext} image. The SSPI receiver installs PKG files and .exfat images only, so this file cannot be sent. The download is kept at {}.", primary.display()));
             }
             Err("Downloaded file has unknown package magic".into())
         }))
